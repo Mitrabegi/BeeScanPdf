@@ -1,0 +1,189 @@
+name: Build BeeScan Pro Final (direct APK, v1+v2 signed)
+on: { workflow_dispatch: {} }
+
+permissions:
+  contents: write   # لازم برای ساخت Release و آپلود APK
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Gradle (SDKMAN)
+        run: |
+          curl -s "https://get.sdkman.io" | bash
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          sdk install gradle 8.7
+          echo "$HOME/.sdkman/candidates/gradle/current/bin" >> $GITHUB_PATH
+
+      # ---------- ساخت پروژه مینیمال جاوا (سازگار و ساده) ----------
+      - name: Generate Android project
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/beescan/profinal
+          mkdir -p app/src/main/res/{values,layout,mipmap-anydpi-v26}
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { gradlePluginPortal(); google(); mavenCentral() } }
+          dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "BeeScanProFinal"
+          include(":app")
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.enableJetifier=true
+          android.nonTransitiveRClass=true
+          android.suppressUnsupportedCompileSdk=34
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins { id "com.android.application" version "8.5.0" apply false }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins { id "com.android.application" }
+          android {
+            namespace "com.beescan.profinal"
+            compileSdk 34
+            defaultConfig {
+              applicationId "com.beescan.profinal"  // یکتا تا تداخلی نباشد
+              minSdk 23
+              targetSdk 34
+              versionCode 1
+              versionName "1.0.0"
+            }
+            buildTypes {
+              release {
+                minifyEnabled false
+                // debuggable به‌صورت پیش‌فرض false است (برای نصب امن‌تر روی MIUI)
+              }
+            }
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+          }
+          dependencies {
+            implementation "androidx.appcompat:appcompat:1.7.0"
+            implementation "com.google.android.material:material:1.12.0"
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application
+              android:label="BeeScan Pro Final"
+              android:icon="@mipmap/ic_launcher"
+              android:roundIcon="@mipmap/ic_launcher"
+              android:theme="@style/Theme.Material3.DayNight.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/layout/activity_main.xml <<'EOF'
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent">
+            <TextView
+              android:layout_width="wrap_content"
+              android:layout_height="wrap_content"
+              android:layout_gravity="center"
+              android:text="BeeScan Pro Final ✅"
+              android:textSize="20sp"/>
+          </FrameLayout>
+          EOF
+
+          cat > app/src/main/java/com/beescan/profinal/MainActivity.java <<'EOF'
+          package com.beescan.profinal;
+          import android.os.Bundle;
+          import androidx.appcompat.app.AppCompatActivity;
+          public class MainActivity extends AppCompatActivity {
+            @Override protected void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              setContentView(R.layout.activity_main);
+            }
+          }
+          EOF
+
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+            <background android:drawable="@android:color/black"/>
+            <foreground android:drawable="@android:color/white"/>
+          </adaptive-icon>
+          EOF
+
+      - name: Build release (unsigned)
+        run: gradle :app:assembleRelease
+
+      # ---------- zipalign + امضا با v1 و v2 (سازگار با MIUI/HyperOS) ----------
+      - name: Align & Sign (v1 + v2)
+        run: |
+          set -e
+          APK_DIR=app/build/outputs/apk/release
+          IN_APK="$APK_DIR/app-release-unsigned.apk"
+          OUT_DIR=out
+          OUT_APK="$OUT_DIR/BeeScanProFinal-${{ github.run_number }}.apk"
+
+          mkdir -p "$OUT_DIR"
+
+          # پیدا کردن آخرین نسخه build-tools
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          BT="$SDK/build-tools/$(ls -1 "$SDK/build-tools" | sort -V | tail -n1)"
+
+          # zipalign
+          "$BT/zipalign" -p 4 "$IN_APK" "$OUT_DIR/aligned.apk"
+
+          # ساخت keystore موقت
+          keytool -genkeypair -v \
+            -storepass android -keypass android \
+            -keystore temp-debug.keystore -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=BeeScanProFinal,O=Bee,C=IR"
+
+          # امضا با v1 + v2
+          "$BT/apksigner" sign \
+            --ks temp-debug.keystore \
+            --ks-key-alias androiddebugkey \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --out "$OUT_APK" \
+            "$OUT_DIR/aligned.apk"
+
+          # بررسی امضا
+          "$BT/apksigner" verify -v "$OUT_APK"
+
+          echo "APK_PATH=$OUT_APK" >> $GITHUB_ENV
+
+      # ---------- آپلود مستقیم APK در Releases (بدون ZIP) ----------
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}-final
+          name: BeeScan Pro Final ${{ github.run_number }}
+          files: ${{ env.APK_PATH }}
+          body: "Signed (v1+v2), packageId=com.beescan.profinal"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
